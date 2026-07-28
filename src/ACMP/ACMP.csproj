@@ -1,0 +1,35 @@
+<Project Sdk="Microsoft.NET.Sdk">
+
+  <PropertyGroup>
+    <TargetFramework>netstandard2.0</TargetFramework>
+    <AssemblyName>ACMP</AssemblyName>
+    <RootNamespace>ACMP</RootNamespace>
+    <Version>0.0.0-local</Version>
+    <PackageId>ACMP</PackageId>
+    <Title>ACMP</Title>
+    <Authors>Martin Engineering AG</Authors>
+    <Copyright>Copyright © 2026 Martin Engineering AG</Copyright>
+    <Description>A typed .NET client for the ALSO Cloud Marketplace Simple API.</Description>
+    <PackageTags>also;cloud;marketplace;api;client</PackageTags>
+    <PackageReadmeFile>README.md</PackageReadmeFile>
+    <PackageLicenseExpression>MIT</PackageLicenseExpression>
+    <PackageRequireLicenseAcceptance>false</PackageRequireLicenseAcceptance>
+    <PackageProjectUrl>https://github.com/MartinEngineeringAG/ACMP</PackageProjectUrl>
+    <RepositoryUrl>https://github.com/MartinEngineeringAG/ACMP</RepositoryUrl>
+    <RepositoryType>git</RepositoryType>
+    <PublishRepositoryUrl>true</PublishRepositoryUrl>
+    <EmbedUntrackedSources>true</EmbedUntrackedSources>
+    <IncludeSymbols>true</IncludeSymbols>
+    <SymbolPackageFormat>snupkg</SymbolPackageFormat>
+    <IsPackable>true</IsPackable>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <PackageReference Include="System.Text.Json" Version="10.0.9" />
+  </ItemGroup>
+
+  <ItemGroup>
+    <None Include="..\..\README.md" Pack="true" PackagePath="\" />
+  </ItemGroup>
+
+</Project>

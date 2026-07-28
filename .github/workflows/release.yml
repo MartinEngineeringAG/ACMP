@@ -1,0 +1,146 @@
+name: Release
+
+on:
+  release:
+    types:
+      - published
+
+permissions:
+  contents: read
+  id-token: write
+
+env:
+  DOTNET_CLI_TELEMETRY_OPTOUT: 1
+  DOTNET_NOLOGO: true
+
+jobs:
+  publish:
+    name: Build and publish
+    runs-on: windows-latest
+    environment: release
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Set up .NET
+        uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: 10.0.x
+
+      - name: Resolve release metadata
+        id: release
+        shell: pwsh
+        env:
+          RELEASE_TAG: ${{ github.event.release.tag_name }}
+        run: |
+          if ($env:RELEASE_TAG -notmatch '^v(?<Version>\d+\.\d+\.\d+)$') {
+              throw "Release tag '$env:RELEASE_TAG' must use vX.Y.Z."
+          }
+          "version=$($Matches.Version)" >> $env:GITHUB_OUTPUT
+
+      - name: Restore
+        run: dotnet restore ACMP.slnx --locked-mode
+
+      - name: Build
+        run: dotnet build ACMP.slnx --configuration Release --no-restore
+
+      - name: Test
+        run: dotnet test ACMP.slnx --configuration Release --no-build
+
+      - name: Pack NuGet package
+        shell: pwsh
+        env:
+          VERSION: ${{ steps.release.outputs.version }}
+          REPOSITORY_URL: https://github.com/${{ github.repository }}
+        run: |
+          dotnet pack .\src\ACMP\ACMP.csproj `
+            --configuration Release `
+            --no-build `
+            --output .\artifacts\nuget `
+            -p:Version=$env:VERSION `
+            -p:RepositoryUrl=$env:REPOSITORY_URL `
+            -p:PackageProjectUrl=$env:REPOSITORY_URL
+
+      - name: Test NuGet package
+        shell: pwsh
+        env:
+          VERSION: ${{ steps.release.outputs.version }}
+        run: |
+          .\build\Test-NuGetPackage.ps1 `
+            -PackageDirectory .\artifacts\nuget `
+            -Version $env:VERSION
+
+      - name: Build PowerShell module
+        shell: pwsh
+        env:
+          VERSION: ${{ steps.release.outputs.version }}
+          RELEASE_TAG: ${{ github.event.release.tag_name }}
+          REPOSITORY_URL: https://github.com/${{ github.repository }}
+        run: |
+          $licenseUri = "$env:REPOSITORY_URL/blob/$env:RELEASE_TAG/LICENSE"
+          .\build\Build-PowerShellModule.ps1 `
+            -Version $env:VERSION `
+            -ProjectUri $env:REPOSITORY_URL `
+            -LicenseUri $licenseUri
+
+      - name: Validate PowerShell module
+        shell: pwsh
+        run: |
+          $manifestPath = '.\artifacts\powershell\ACMP\ACMP.psd1'
+          Test-ModuleManifest -Path $manifestPath -ErrorAction Stop | Out-Null
+          Import-Module -Name $manifestPath -Force -ErrorAction Stop
+          $commands = @(Get-Command -Module ACMP)
+          if ($commands.Count -ne 74) {
+              throw "Expected 74 ACMP cmdlets, found $($commands.Count)."
+          }
+
+      - name: Log in to NuGet
+        id: nuget
+        uses: NuGet/login@v1
+        with:
+          user: ${{ vars.NUGET_USER }}
+
+      - name: Publish NuGet package
+        shell: pwsh
+        env:
+          NUGET_API_KEY: ${{ steps.nuget.outputs.NUGET_API_KEY }}
+          VERSION: ${{ steps.release.outputs.version }}
+        run: |
+          dotnet nuget push ".\artifacts\nuget\ACMP.$env:VERSION.nupkg" `
+            --api-key $env:NUGET_API_KEY `
+            --source https://api.nuget.org/v3/index.json `
+            --skip-duplicate
+
+      - name: Publish PowerShell module
+        shell: pwsh
+        env:
+          PSGALLERY_API_KEY: ${{ secrets.PSGALLERY_API_KEY }}
+          VERSION: ${{ steps.release.outputs.version }}
+        run: |
+          $existing = Find-Module `
+            -Name ACMP `
+            -RequiredVersion $env:VERSION `
+            -Repository PSGallery `
+            -ErrorAction SilentlyContinue
+          if ($null -eq $existing) {
+              Publish-Module `
+                -Path .\artifacts\powershell\ACMP `
+                -Repository PSGallery `
+                -NuGetApiKey $env:PSGALLERY_API_KEY `
+                -ErrorAction Stop
+          }
+          else {
+              Write-Host "ACMP $env:VERSION already exists in PowerShell Gallery."
+          }
+
+      - name: Upload release artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: acmp-${{ steps.release.outputs.version }}
+          path: |
+            artifacts/nuget/*.nupkg
+            artifacts/nuget/*.snupkg
+            artifacts/powershell/ACMP
