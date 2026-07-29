@@ -1,0 +1,578 @@
+name: Prepare Release
+
+on:
+  workflow_dispatch:
+    inputs:
+      release_type:
+        description: Packages to release
+        required: true
+        type: choice
+        options:
+          - combined
+          - powershell-only
+      acmp_version:
+        description: ACMP NuGet version (X.Y.Z; combined releases only)
+        required: false
+        type: string
+      powershell_version:
+        description: ACMP PowerShell version (X.Y.Z)
+        required: true
+        type: string
+
+permissions:
+  contents: write
+
+concurrency:
+  group: acmp-release-preparation
+  cancel-in-progress: false
+
+env:
+  DOTNET_CLI_TELEMETRY_OPTOUT: 1
+  DOTNET_NOLOGO: true
+
+jobs:
+  prepare:
+    name: Build and create draft
+    runs-on: windows-latest
+
+    steps:
+      - name: Require main
+        shell: pwsh
+        env:
+          WORKFLOW_REF: ${{ github.ref }}
+        run: |
+          if ($env:WORKFLOW_REF -cne 'refs/heads/main') {
+              throw 'Run the Prepare Release workflow from the main branch.'
+          }
+
+      - name: Check out main
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0
+          ref: main
+
+      - name: Set up .NET
+        uses: actions/setup-dotnet@a98b56852c35b8e3190ac28c8c2271da59106c68 # v6.0.0
+        with:
+          dotnet-version: 10.0.x
+
+      - name: Resolve release metadata and create local tags
+        id: release
+        shell: pwsh
+        env:
+          ACMP_VERSION_INPUT: ${{ inputs.acmp_version }}
+          GH_TOKEN: ${{ github.token }}
+          POWERSHELL_VERSION_INPUT: ${{ inputs.powershell_version }}
+          RELEASE_TYPE_INPUT: ${{ inputs.release_type }}
+        run: |
+          $stableVersionPattern = '(?:0|[1-9]\d*)\.(?:0|[1-9]\d*)\.(?:0|[1-9]\d*)'
+
+          function Get-StableTags {
+              param(
+                  [Parameter(Mandatory)]
+                  [string]$Prefix
+              )
+
+              $pattern = "^$([regex]::Escape($Prefix))(?<Version>$stableVersionPattern)$"
+              foreach ($tag in @(git tag --merged HEAD --list "$Prefix*")) {
+                  if ($tag -match $pattern) {
+                      [pscustomobject]@{
+                          Name    = $tag
+                          Version = [version]$Matches.Version
+                      }
+                  }
+              }
+          }
+
+          function Assert-VersionAdvances {
+              param(
+                  [Parameter(Mandatory)]
+                  [version]$Version,
+
+                  [Parameter(Mandatory)]
+                  [string]$Prefix,
+
+                  [Parameter(Mandatory)]
+                  [string]$CurrentTag
+              )
+
+              $previousTag = @(
+                  Get-StableTags -Prefix $Prefix |
+                      Where-Object { $PSItem.Name -cne $CurrentTag } |
+                      Sort-Object Version -Descending
+              ) | Select-Object -First 1
+              if ($null -ne $previousTag -and
+                  $Version -le $previousTag.Version) {
+                  throw "Version '$Version' must be newer than '$($previousTag.Version)' from tag '$($previousTag.Name)'."
+              }
+          }
+
+          function Assert-TagAvailable {
+              param(
+                  [Parameter(Mandatory)]
+                  [string]$Tag,
+
+                  [Parameter(Mandatory)]
+                  [string]$Commit
+              )
+
+              git show-ref --verify --quiet "refs/tags/$Tag"
+              if ($LASTEXITCODE -eq 0) {
+                  $tagCommit = git rev-parse "refs/tags/$Tag^{commit}"
+                  if ($LASTEXITCODE -ne 0 -or $tagCommit -cne $Commit) {
+                      throw "Tag '$Tag' already exists on a different commit."
+                  }
+                  return
+              }
+              if ($LASTEXITCODE -ne 1) {
+                  throw "Failed to check tag '$Tag' (exit code $LASTEXITCODE)."
+              }
+
+              git tag $Tag $Commit
+              if ($LASTEXITCODE -ne 0) {
+                  throw "Failed to create local tag '$Tag'."
+              }
+          }
+
+          if ($env:POWERSHELL_VERSION_INPUT -notmatch "^$stableVersionPattern$") {
+              throw "PowerShell version '$env:POWERSHELL_VERSION_INPUT' must use X.Y.Z without a tag prefix or prerelease label."
+          }
+          $powerShellVersion = [version]$env:POWERSHELL_VERSION_INPUT
+          $powerShellVersionText = $powerShellVersion.ToString(3)
+          $powerShellTag = "acmp-powershell-v$powerShellVersionText"
+
+          $releaseCommit = git rev-parse HEAD
+          if ($LASTEXITCODE -ne 0) {
+              throw 'Failed to resolve the release commit.'
+          }
+          $originMainCommit = git rev-parse refs/remotes/origin/main
+          if ($LASTEXITCODE -ne 0 -or $releaseCommit -cne $originMainCommit) {
+              throw 'The checked-out commit is not the current origin/main commit.'
+          }
+
+          Assert-VersionAdvances `
+              -Version $powerShellVersion `
+              -Prefix 'acmp-powershell-v' `
+              -CurrentTag $powerShellTag
+
+          if ($env:RELEASE_TYPE_INPUT -ceq 'combined') {
+              if ($env:ACMP_VERSION_INPUT -notmatch "^$stableVersionPattern$") {
+                  throw "ACMP version '$env:ACMP_VERSION_INPUT' must use X.Y.Z without a tag prefix or prerelease label."
+              }
+              $acmpVersion = [version]$env:ACMP_VERSION_INPUT
+              $acmpVersionText = $acmpVersion.ToString(3)
+              $acmpTag = "acmp-v$acmpVersionText"
+              $primaryTag = $acmpTag
+              $acmpVersionOverride = ''
+
+              Assert-VersionAdvances `
+                  -Version $acmpVersion `
+                  -Prefix 'acmp-v' `
+                  -CurrentTag $acmpTag
+
+              $previousPrimaryTag = @(
+                  Get-StableTags -Prefix 'acmp-v' |
+                      Where-Object { $PSItem.Name -cne $primaryTag } |
+                      Sort-Object Version -Descending
+              ) | Select-Object -First 1 -ExpandProperty Name
+          }
+          elseif ($env:RELEASE_TYPE_INPUT -ceq 'powershell-only') {
+              if (-not [string]::IsNullOrWhiteSpace($env:ACMP_VERSION_INPUT)) {
+                  throw 'Leave ACMP version empty for a PowerShell-only release.'
+              }
+
+              $acmpTags = @(
+                  Get-StableTags -Prefix 'acmp-v' |
+                      Sort-Object Version -Descending
+              )
+              if ($acmpTags.Count -eq 0) {
+                  throw 'A PowerShell-only release requires an earlier acmp-vX.Y.Z release.'
+              }
+
+              $acmpTag = $acmpTags[0].Name
+              $acmpVersionText = $acmpTags[0].Version.ToString(3)
+              $primaryTag = $powerShellTag
+              $acmpVersionOverride = $acmpVersionText
+
+              git diff --quiet "$acmpTag..HEAD" -- src/ACMP Directory.Build.props Directory.Build.targets
+              if ($LASTEXITCODE -eq 1) {
+                  throw "ACMP changed after '$acmpTag'; prepare a combined release instead."
+              }
+              if ($LASTEXITCODE -ne 0) {
+                  throw "Failed to compare ACMP with '$acmpTag' (exit code $LASTEXITCODE)."
+              }
+
+              $previousPrimaryTag = @(
+                  Get-StableTags -Prefix 'acmp-powershell-v' |
+                      Where-Object { $PSItem.Name -cne $primaryTag } |
+                      Sort-Object Version -Descending
+              ) | Select-Object -First 1 -ExpandProperty Name
+          }
+          else {
+              throw "Unsupported release type '$env:RELEASE_TYPE_INPUT'."
+          }
+
+          gh release view $primaryTag --json isDraft
+          if ($LASTEXITCODE -eq 0) {
+              throw "A GitHub release already exists for '$primaryTag'."
+          }
+
+          if ($env:RELEASE_TYPE_INPUT -ceq 'combined') {
+              Assert-TagAvailable -Tag $acmpTag -Commit $releaseCommit
+          }
+          Assert-TagAvailable -Tag $powerShellTag -Commit $releaseCommit
+
+          "release_type=$env:RELEASE_TYPE_INPUT" >> $env:GITHUB_OUTPUT
+          "commit=$releaseCommit" >> $env:GITHUB_OUTPUT
+          "primary_tag=$primaryTag" >> $env:GITHUB_OUTPUT
+          "acmp_tag=$acmpTag" >> $env:GITHUB_OUTPUT
+          "acmp_version=$acmpVersionText" >> $env:GITHUB_OUTPUT
+          "acmp_version_override=$acmpVersionOverride" >> $env:GITHUB_OUTPUT
+          "powershell_tag=$powerShellTag" >> $env:GITHUB_OUTPUT
+          "powershell_version=$powerShellVersionText" >> $env:GITHUB_OUTPUT
+          "previous_primary_tag=$previousPrimaryTag" >> $env:GITHUB_OUTPUT
+
+      - name: Check package versions are available
+        shell: pwsh
+        env:
+          ACMP_VERSION: ${{ steps.release.outputs.acmp_version }}
+          POWERSHELL_VERSION: ${{ steps.release.outputs.powershell_version }}
+          RELEASE_TYPE: ${{ steps.release.outputs.release_type }}
+        run: |
+          $nugetResponse = Invoke-WebRequest `
+              -Uri 'https://api.nuget.org/v3-flatcontainer/acmp/index.json' `
+              -SkipHttpErrorCheck
+          if ($nugetResponse.StatusCode -eq 200) {
+              $nugetVersions = @(
+                  ($nugetResponse.Content | ConvertFrom-Json).versions
+              )
+          }
+          elseif ($nugetResponse.StatusCode -eq 404) {
+              $nugetVersions = @()
+          }
+          else {
+              throw "NuGet returned HTTP $($nugetResponse.StatusCode) while checking ACMP versions."
+          }
+
+          if ($env:RELEASE_TYPE -ceq 'combined') {
+              if ($nugetVersions -ccontains $env:ACMP_VERSION) {
+                  throw "ACMP $env:ACMP_VERSION already exists on NuGet."
+              }
+          }
+          elseif ($nugetVersions -cnotcontains $env:ACMP_VERSION) {
+              throw "Required ACMP $env:ACMP_VERSION is not available on NuGet."
+          }
+
+          $existingModule = Find-Module `
+              -Name ACMP `
+              -RequiredVersion $env:POWERSHELL_VERSION `
+              -Repository PSGallery `
+              -ErrorAction SilentlyContinue
+          if ($null -ne $existingModule) {
+              throw "ACMP $env:POWERSHELL_VERSION already exists in PowerShell Gallery."
+          }
+
+      - name: Restore
+        run: dotnet restore ACMP.slnx --locked-mode
+
+      - name: Build
+        shell: pwsh
+        env:
+          ACMP_VERSION_OVERRIDE: ${{ steps.release.outputs.acmp_version_override }}
+        run: |
+          $arguments = @(
+              'build',
+              'ACMP.slnx',
+              '--configuration',
+              'Release',
+              '--no-restore'
+          )
+          if ($env:ACMP_VERSION_OVERRIDE) {
+              $arguments += "-p:AcmpVersionOverride=$env:ACMP_VERSION_OVERRIDE"
+          }
+          & dotnet $arguments
+          if ($LASTEXITCODE -ne 0) {
+              throw "dotnet build failed with exit code $LASTEXITCODE."
+          }
+
+      - name: Test
+        run: dotnet test ACMP.slnx --configuration Release --no-build
+
+      - name: Pack NuGet package
+        if: steps.release.outputs.release_type == 'combined'
+        shell: pwsh
+        env:
+          REPOSITORY_URL: https://github.com/${{ github.repository }}
+        run: |
+          dotnet pack .\src\ACMP\ACMP.csproj `
+            --configuration Release `
+            --no-build `
+            --output .\artifacts\nuget `
+            -p:RepositoryUrl=$env:REPOSITORY_URL `
+            -p:PackageProjectUrl=$env:REPOSITORY_URL
+
+      - name: Test NuGet package
+        if: steps.release.outputs.release_type == 'combined'
+        shell: pwsh
+        env:
+          VERSION: ${{ steps.release.outputs.acmp_version }}
+        run: |
+          .\build\Test-NuGetPackage.ps1 `
+            -PackageDirectory .\artifacts\nuget `
+            -ExpectedVersion $env:VERSION
+
+      - name: Build PowerShell module
+        shell: pwsh
+        env:
+          ACMP_VERSION_OVERRIDE: ${{ steps.release.outputs.acmp_version_override }}
+          RELEASE_TAG: ${{ steps.release.outputs.primary_tag }}
+          REPOSITORY_URL: https://github.com/${{ github.repository }}
+        run: |
+          $parameters = @{
+              ProjectUri = $env:REPOSITORY_URL
+              LicenseUri = "$env:REPOSITORY_URL/blob/$env:RELEASE_TAG/LICENSE"
+          }
+          if ($env:ACMP_VERSION_OVERRIDE) {
+              $parameters.AcmpVersionOverride = $env:ACMP_VERSION_OVERRIDE
+          }
+          .\build\Build-PowerShellModule.ps1 @parameters
+
+      - name: Validate PowerShell module with PowerShell 7
+        shell: pwsh
+        env:
+          ACMP_VERSION: ${{ steps.release.outputs.acmp_version }}
+          POWERSHELL_VERSION: ${{ steps.release.outputs.powershell_version }}
+        run: |
+          .\build\Test-PowerShellModule.ps1 `
+            -ExpectedVersion $env:POWERSHELL_VERSION `
+            -ExpectedAcmpVersion $env:ACMP_VERSION
+
+      - name: Validate PowerShell module with Windows PowerShell 5.1
+        shell: powershell
+        env:
+          ACMP_VERSION: ${{ steps.release.outputs.acmp_version }}
+          POWERSHELL_VERSION: ${{ steps.release.outputs.powershell_version }}
+        run: |
+          .\build\Test-PowerShellModule.ps1 `
+            -ExpectedVersion $env:POWERSHELL_VERSION `
+            -ExpectedAcmpVersion $env:ACMP_VERSION
+
+      - name: Create release assets
+        shell: pwsh
+        env:
+          ACMP_TAG: ${{ steps.release.outputs.acmp_tag }}
+          ACMP_VERSION: ${{ steps.release.outputs.acmp_version }}
+          COMMIT: ${{ steps.release.outputs.commit }}
+          POWERSHELL_TAG: ${{ steps.release.outputs.powershell_tag }}
+          POWERSHELL_VERSION: ${{ steps.release.outputs.powershell_version }}
+          PRIMARY_TAG: ${{ steps.release.outputs.primary_tag }}
+          RELEASE_TYPE: ${{ steps.release.outputs.release_type }}
+          REPOSITORY: ${{ github.repository }}
+          RUN_ID: ${{ github.run_id }}
+        run: |
+          $releaseRoot = Join-Path $PWD 'artifacts\release'
+          $null = New-Item -ItemType Directory -Path $releaseRoot -Force
+
+          $moduleArchiveName = "ACMP.PowerShell.$env:POWERSHELL_VERSION.zip"
+          $moduleArchivePath = Join-Path $releaseRoot $moduleArchiveName
+          Compress-Archive `
+              -LiteralPath .\artifacts\powershell\ACMP `
+              -DestinationPath $moduleArchivePath `
+              -CompressionLevel Optimal
+
+          $expectedAssetNames = @($moduleArchiveName)
+          if ($env:RELEASE_TYPE -ceq 'combined') {
+              $nugetAssetNames = @(
+                  "ACMP.$env:ACMP_VERSION.nupkg",
+                  "ACMP.$env:ACMP_VERSION.snupkg"
+              )
+              foreach ($assetName in $nugetAssetNames) {
+                  $assetPath = Join-Path .\artifacts\nuget $assetName
+                  if (-not (Test-Path -LiteralPath $assetPath -PathType Leaf)) {
+                      throw "Expected release asset '$assetPath' was not created."
+                  }
+                  Copy-Item `
+                      -LiteralPath $assetPath `
+                      -Destination $releaseRoot
+              }
+              $expectedAssetNames += $nugetAssetNames
+          }
+
+          $actualAssetNames = @(
+              Get-ChildItem -LiteralPath $releaseRoot -File |
+                  Select-Object -ExpandProperty Name |
+                  Sort-Object
+          )
+          $sortedExpectedAssetNames = @($expectedAssetNames | Sort-Object)
+          if (Compare-Object `
+                  -ReferenceObject $sortedExpectedAssetNames `
+                  -DifferenceObject $actualAssetNames) {
+              throw 'The prepared release does not contain exactly the expected package assets.'
+          }
+
+          $assets = @(
+              Get-ChildItem -LiteralPath $releaseRoot -File |
+                  Sort-Object Name |
+                  ForEach-Object {
+                      [ordered]@{
+                          name   = $PSItem.Name
+                          size   = $PSItem.Length
+                          sha256 = (Get-FileHash `
+                              -LiteralPath $PSItem.FullName `
+                              -Algorithm SHA256).Hash.ToLowerInvariant()
+                      }
+                  }
+          )
+
+          $manifest = [ordered]@{
+              schemaVersion     = 1
+              repository        = $env:REPOSITORY
+              preparationRunId  = [long]$env:RUN_ID
+              releaseType       = $env:RELEASE_TYPE
+              commit            = $env:COMMIT
+              primaryTag        = $env:PRIMARY_TAG
+              acmpTag           = $env:ACMP_TAG
+              acmpVersion       = $env:ACMP_VERSION
+              powershellTag     = $env:POWERSHELL_TAG
+              powershellVersion = $env:POWERSHELL_VERSION
+              assets            = $assets
+          }
+          $manifest |
+              ConvertTo-Json -Depth 5 |
+              Set-Content `
+                  -LiteralPath (Join-Path $releaseRoot 'release-manifest.json') `
+                  -Encoding utf8
+
+      - name: Upload prepared assets
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          if-no-files-found: error
+          name: prepared-release-assets
+          path: artifacts/release/*
+
+      - name: Push release tags
+        shell: pwsh
+        env:
+          ACMP_TAG: ${{ steps.release.outputs.acmp_tag }}
+          COMMIT: ${{ steps.release.outputs.commit }}
+          POWERSHELL_TAG: ${{ steps.release.outputs.powershell_tag }}
+        run: |
+          git fetch --no-tags origin '+refs/heads/main:refs/remotes/origin/main'
+          if ($LASTEXITCODE -ne 0) {
+              throw "Failed to refresh origin/main (exit code $LASTEXITCODE)."
+          }
+
+          $originMainCommit = git rev-parse refs/remotes/origin/main
+          if ($LASTEXITCODE -ne 0 -or $originMainCommit -cne $env:COMMIT) {
+              throw 'The main branch changed while the release was being prepared. Run the workflow again.'
+          }
+
+          $tags = @($env:POWERSHELL_TAG)
+          if ($env:ACMP_TAG -cne $env:POWERSHELL_TAG) {
+              git show-ref --verify --quiet "refs/tags/$env:ACMP_TAG"
+              if ($LASTEXITCODE -ne 0) {
+                  throw "Required ACMP tag '$env:ACMP_TAG' does not exist."
+              }
+
+              $acmpTagCommit = git rev-parse "refs/tags/$env:ACMP_TAG^{commit}"
+              if ($LASTEXITCODE -ne 0) {
+                  throw "Failed to resolve ACMP tag '$env:ACMP_TAG'."
+              }
+              if ($acmpTagCommit -ceq $env:COMMIT) {
+                  $tags += $env:ACMP_TAG
+              }
+          }
+          $pushArguments = @('push', '--atomic', 'origin')
+          foreach ($tag in $tags) {
+              $pushArguments += "refs/tags/${tag}:refs/tags/${tag}"
+          }
+
+          & git $pushArguments
+          if ($LASTEXITCODE -ne 0) {
+              throw "Failed to push release tags atomically (exit code $LASTEXITCODE)."
+          }
+
+      - name: Create draft GitHub release
+        id: draft
+        shell: pwsh
+        env:
+          ACMP_VERSION: ${{ steps.release.outputs.acmp_version }}
+          GH_TOKEN: ${{ github.token }}
+          POWERSHELL_VERSION: ${{ steps.release.outputs.powershell_version }}
+          PREVIOUS_PRIMARY_TAG: ${{ steps.release.outputs.previous_primary_tag }}
+          PRIMARY_TAG: ${{ steps.release.outputs.primary_tag }}
+          RELEASE_TYPE: ${{ steps.release.outputs.release_type }}
+        run: |
+          if ($env:RELEASE_TYPE -ceq 'combined') {
+              $title = "ACMP .NET $env:ACMP_VERSION and PowerShell $env:POWERSHELL_VERSION"
+              $intro = @"
+          This release contains:
+
+          - NuGet package ``ACMP`` $env:ACMP_VERSION
+          - PowerShell Gallery module ``ACMP`` $env:POWERSHELL_VERSION
+          "@
+          }
+          else {
+              $title = "ACMP PowerShell $env:POWERSHELL_VERSION"
+              $intro = @"
+          This release contains PowerShell Gallery module ``ACMP`` $env:POWERSHELL_VERSION.
+          It bundles the previously released ``ACMP`` .NET client $env:ACMP_VERSION.
+          "@
+          }
+
+          $notesPath = Join-Path $env:RUNNER_TEMP 'release-introduction.md'
+          $intro | Set-Content -LiteralPath $notesPath -Encoding utf8
+
+          $arguments = @(
+              'release',
+              'create',
+              $env:PRIMARY_TAG,
+              '--draft',
+              '--generate-notes',
+              '--notes-file',
+              $notesPath,
+              '--title',
+              $title,
+              '--verify-tag'
+          )
+          if ($env:PREVIOUS_PRIMARY_TAG) {
+              $arguments += @(
+                  '--notes-start-tag',
+                  $env:PREVIOUS_PRIMARY_TAG
+              )
+          }
+          $arguments += @(
+              Get-ChildItem -LiteralPath .\artifacts\release -File |
+                  Sort-Object Name |
+                  Select-Object -ExpandProperty FullName
+          )
+
+          $releaseUrl = & gh $arguments
+          if ($LASTEXITCODE -ne 0) {
+              throw "Failed to create the draft GitHub release (exit code $LASTEXITCODE)."
+          }
+
+          "url=$releaseUrl" >> $env:GITHUB_OUTPUT
+
+      - name: Write preparation summary
+        shell: pwsh
+        env:
+          ACMP_VERSION: ${{ steps.release.outputs.acmp_version }}
+          COMMIT: ${{ steps.release.outputs.commit }}
+          POWERSHELL_VERSION: ${{ steps.release.outputs.powershell_version }}
+          PRIMARY_TAG: ${{ steps.release.outputs.primary_tag }}
+          RELEASE_TYPE: ${{ steps.release.outputs.release_type }}
+          RELEASE_URL: ${{ steps.draft.outputs.url }}
+        run: |
+          @"
+          ## Draft release prepared
+
+          - Draft: [$env:PRIMARY_TAG]($env:RELEASE_URL)
+          - Commit: ``$env:COMMIT``
+          - Release type: $env:RELEASE_TYPE
+          - NuGet ACMP version: ``$env:ACMP_VERSION``
+          - PowerShell ACMP version: ``$env:POWERSHELL_VERSION``
+
+          The draft contains the exact packages built and validated by this run.
+          Review the draft and its assets, then publish it to start package publication.
+          "@ >> $env:GITHUB_STEP_SUMMARY

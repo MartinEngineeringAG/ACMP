@@ -1,0 +1,292 @@
+name: Publish Release
+
+on:
+  release:
+    types:
+      - published
+
+permissions:
+  contents: read
+
+env:
+  DOTNET_CLI_TELEMETRY_OPTOUT: 1
+  DOTNET_NOLOGO: true
+
+jobs:
+  validate:
+    name: Validate release assets
+    runs-on: windows-latest
+    outputs:
+      acmp_version: ${{ steps.release.outputs.acmp_version }}
+      module_archive: ${{ steps.release.outputs.module_archive }}
+      powershell_version: ${{ steps.release.outputs.powershell_version }}
+      release_type: ${{ steps.release.outputs.release_type }}
+
+    steps:
+      - name: Check out release tag
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0
+          ref: ${{ github.event.release.tag_name }}
+
+      - name: Download release assets
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RELEASE_TAG: ${{ github.event.release.tag_name }}
+        run: |
+          $null = New-Item `
+              -ItemType Directory `
+              -Path .\artifacts\release `
+              -Force
+          gh release download $env:RELEASE_TAG `
+              --dir .\artifacts\release
+          if ($LASTEXITCODE -ne 0) {
+              throw "Failed to download assets for '$env:RELEASE_TAG'."
+          }
+
+      - name: Validate release manifest and assets
+        id: release
+        shell: pwsh
+        env:
+          EVENT_COMMIT: ${{ github.sha }}
+          IS_PRERELEASE: ${{ github.event.release.prerelease }}
+          RELEASE_TAG: ${{ github.event.release.tag_name }}
+          REPOSITORY: ${{ github.repository }}
+        run: |
+          $stableVersionPattern = '(?:0|[1-9]\d*)\.(?:0|[1-9]\d*)\.(?:0|[1-9]\d*)'
+          $manifestPath = Join-Path $PWD 'artifacts\release\release-manifest.json'
+          if (-not (Test-Path -LiteralPath $manifestPath -PathType Leaf)) {
+              throw 'The release does not contain release-manifest.json. Prepare it with the Prepare Release workflow.'
+          }
+
+          $manifest = Get-Content -LiteralPath $manifestPath -Raw |
+              ConvertFrom-Json
+          if ($manifest.schemaVersion -ne 1) {
+              throw "Unsupported release manifest version '$($manifest.schemaVersion)'."
+          }
+          if ($manifest.repository -cne $env:REPOSITORY) {
+              throw "Release manifest repository '$($manifest.repository)' does not match '$env:REPOSITORY'."
+          }
+          if ($manifest.primaryTag -cne $env:RELEASE_TAG) {
+              throw "Release tag '$env:RELEASE_TAG' does not match manifest tag '$($manifest.primaryTag)'."
+          }
+          if ($env:IS_PRERELEASE -eq 'true') {
+              throw 'GitHub prereleases cannot publish ACMP packages.'
+          }
+
+          $headCommit = git rev-parse HEAD
+          if ($LASTEXITCODE -ne 0) {
+              throw 'Failed to resolve the checked-out release commit.'
+          }
+          if ($manifest.commit -cne $headCommit -or
+              $env:EVENT_COMMIT -cne $headCommit) {
+              throw "Release assets were prepared for '$($manifest.commit)', but the release points to '$headCommit'."
+          }
+
+          git fetch --no-tags origin '+refs/heads/main:refs/remotes/origin/main'
+          if ($LASTEXITCODE -ne 0) {
+              throw "Failed to fetch origin/main (exit code $LASTEXITCODE)."
+          }
+          git merge-base --is-ancestor HEAD refs/remotes/origin/main
+          if ($LASTEXITCODE -eq 1) {
+              throw 'The release tag must point to a commit contained in main.'
+          }
+          if ($LASTEXITCODE -ne 0) {
+              throw "Failed to verify the release commit (exit code $LASTEXITCODE)."
+          }
+
+          if ($manifest.acmpVersion -notmatch "^$stableVersionPattern$" -or
+              $manifest.powershellVersion -notmatch "^$stableVersionPattern$") {
+              throw 'The release manifest contains an invalid stable version.'
+          }
+          if ($manifest.acmpTag -cne "acmp-v$($manifest.acmpVersion)" -or
+              $manifest.powershellTag -cne "acmp-powershell-v$($manifest.powershellVersion)") {
+              throw 'The release manifest tag names do not match their versions.'
+          }
+
+          $acmpTagsAtHead = @(
+              git tag --points-at HEAD |
+                  Where-Object { $PSItem -match "^acmp-v$stableVersionPattern$" }
+          )
+          $powerShellTagsAtHead = @(
+              git tag --points-at HEAD |
+                  Where-Object { $PSItem -match "^acmp-powershell-v$stableVersionPattern$" }
+          )
+
+          if ($manifest.releaseType -ceq 'combined') {
+              if ($manifest.primaryTag -cne $manifest.acmpTag) {
+                  throw 'A combined release must use its ACMP tag as the primary tag.'
+              }
+              if ($acmpTagsAtHead.Count -ne 1 -or
+                  $acmpTagsAtHead[0] -cne $manifest.acmpTag -or
+                  $powerShellTagsAtHead.Count -ne 1 -or
+                  $powerShellTagsAtHead[0] -cne $manifest.powershellTag) {
+                  throw 'The combined release tags do not match the prepared release.'
+              }
+              $expectedAssetNames = @(
+                  "ACMP.$($manifest.acmpVersion).nupkg",
+                  "ACMP.$($manifest.acmpVersion).snupkg",
+                  "ACMP.PowerShell.$($manifest.powershellVersion).zip"
+              )
+          }
+          elseif ($manifest.releaseType -ceq 'powershell-only') {
+              if ($manifest.primaryTag -cne $manifest.powershellTag) {
+                  throw 'A PowerShell-only release must use its PowerShell tag as the primary tag.'
+              }
+              if ($acmpTagsAtHead.Count -ne 0 -or
+                  $powerShellTagsAtHead.Count -ne 1 -or
+                  $powerShellTagsAtHead[0] -cne $manifest.powershellTag) {
+                  throw 'The PowerShell-only release tags do not match the prepared release.'
+              }
+
+              git show-ref --verify --quiet "refs/tags/$($manifest.acmpTag)"
+              if ($LASTEXITCODE -ne 0) {
+                  throw "Required ACMP tag '$($manifest.acmpTag)' does not exist."
+              }
+              git diff --quiet "$($manifest.acmpTag)..HEAD" -- src/ACMP Directory.Build.props Directory.Build.targets
+              if ($LASTEXITCODE -eq 1) {
+                  throw "ACMP changed after '$($manifest.acmpTag)'; a combined release is required."
+              }
+              if ($LASTEXITCODE -ne 0) {
+                  throw "Failed to compare ACMP with '$($manifest.acmpTag)' (exit code $LASTEXITCODE)."
+              }
+
+              $expectedAssetNames = @(
+                  "ACMP.PowerShell.$($manifest.powershellVersion).zip"
+              )
+          }
+          else {
+              throw "Unsupported release type '$($manifest.releaseType)'."
+          }
+
+          $manifestAssetNames = @(
+              $manifest.assets |
+                  ForEach-Object { $PSItem.name } |
+                  Sort-Object
+          )
+          $sortedExpectedAssetNames = @($expectedAssetNames | Sort-Object)
+          if (Compare-Object `
+                  -ReferenceObject $sortedExpectedAssetNames `
+                  -DifferenceObject $manifestAssetNames) {
+              throw 'The release manifest does not list exactly the expected package assets.'
+          }
+
+          $actualAssetNames = @(
+              Get-ChildItem -LiteralPath .\artifacts\release -File |
+                  Where-Object { $PSItem.Name -cne 'release-manifest.json' } |
+                  Select-Object -ExpandProperty Name |
+                  Sort-Object
+          )
+          if (Compare-Object `
+                  -ReferenceObject $sortedExpectedAssetNames `
+                  -DifferenceObject $actualAssetNames) {
+              throw 'The GitHub release does not contain exactly the expected package assets.'
+          }
+
+          foreach ($asset in @($manifest.assets)) {
+              $assetPath = Join-Path .\artifacts\release $asset.name
+              $file = Get-Item -LiteralPath $assetPath
+              if ($file.Length -ne $asset.size) {
+                  throw "Release asset '$($asset.name)' has an unexpected size."
+              }
+              $hash = (Get-FileHash `
+                  -LiteralPath $file.FullName `
+                  -Algorithm SHA256).Hash.ToLowerInvariant()
+              if ($hash -cne $asset.sha256) {
+                  throw "Release asset '$($asset.name)' failed SHA-256 validation."
+              }
+          }
+
+          "release_type=$($manifest.releaseType)" >> $env:GITHUB_OUTPUT
+          "acmp_version=$($manifest.acmpVersion)" >> $env:GITHUB_OUTPUT
+          "powershell_version=$($manifest.powershellVersion)" >> $env:GITHUB_OUTPUT
+          "module_archive=ACMP.PowerShell.$($manifest.powershellVersion).zip" >> $env:GITHUB_OUTPUT
+
+      - name: Upload validated release assets
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          if-no-files-found: error
+          name: validated-release-assets
+          path: artifacts/release/*
+
+  publish:
+    name: Publish packages
+    needs: validate
+    runs-on: windows-latest
+    environment: Release
+    concurrency:
+      group: acmp-package-publication
+      cancel-in-progress: false
+    permissions:
+      contents: read
+      id-token: write
+
+    steps:
+      - name: Set up .NET
+        if: needs.validate.outputs.release_type == 'combined'
+        uses: actions/setup-dotnet@a98b56852c35b8e3190ac28c8c2271da59106c68 # v6.0.0
+        with:
+          dotnet-version: 10.0.x
+
+      - name: Download validated release assets
+        uses: actions/download-artifact@70fc10c6e5e1ce46ad2ea6f2b72d43f7d47b13c3 # v8.0.0
+        with:
+          name: validated-release-assets
+          path: artifacts/release
+
+      - name: Log in to NuGet
+        if: needs.validate.outputs.release_type == 'combined'
+        id: nuget
+        uses: NuGet/login@8d196754b4036150537f80ac539e15c2f1028841 # v1.2.0
+        with:
+          user: ${{ vars.NUGET_USER }}
+
+      - name: Publish NuGet package
+        if: needs.validate.outputs.release_type == 'combined'
+        shell: pwsh
+        env:
+          NUGET_API_KEY: ${{ steps.nuget.outputs.NUGET_API_KEY }}
+          VERSION: ${{ needs.validate.outputs.acmp_version }}
+        run: |
+          dotnet nuget push ".\artifacts\release\ACMP.$env:VERSION.nupkg" `
+            --api-key $env:NUGET_API_KEY `
+            --source https://api.nuget.org/v3/index.json `
+            --skip-duplicate
+
+      - name: Extract PowerShell module
+        shell: pwsh
+        env:
+          MODULE_ARCHIVE: ${{ needs.validate.outputs.module_archive }}
+        run: |
+          Expand-Archive `
+              -LiteralPath ".\artifacts\release\$env:MODULE_ARCHIVE" `
+              -DestinationPath .\artifacts\powershell
+
+          $manifestPath = '.\artifacts\powershell\ACMP\ACMP.psd1'
+          if (-not (Test-Path -LiteralPath $manifestPath -PathType Leaf)) {
+              throw "The prepared module archive does not contain '$manifestPath'."
+          }
+          $null = Test-ModuleManifest -Path $manifestPath
+
+      - name: Publish PowerShell module
+        shell: pwsh
+        env:
+          PSGALLERY_API_KEY: ${{ secrets.PSGALLERY_API_KEY }}
+          VERSION: ${{ needs.validate.outputs.powershell_version }}
+        run: |
+          $existing = Find-Module `
+              -Name ACMP `
+              -RequiredVersion $env:VERSION `
+              -Repository PSGallery `
+              -ErrorAction SilentlyContinue
+          if ($null -eq $existing) {
+              Publish-Module `
+                  -Path .\artifacts\powershell\ACMP `
+                  -Repository PSGallery `
+                  -NuGetApiKey $env:PSGALLERY_API_KEY `
+                  -ErrorAction Stop
+          }
+          else {
+              Write-Host "ACMP $env:VERSION already exists in PowerShell Gallery."
+          }

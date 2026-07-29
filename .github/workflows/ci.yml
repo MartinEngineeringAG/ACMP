@@ -1,0 +1,127 @@
+name: CI
+
+on:
+  push:
+    branches:
+      - main
+  pull_request:
+    branches:
+      - main
+
+permissions:
+  contents: read
+
+env:
+  DOTNET_CLI_TELEMETRY_OPTOUT: 1
+  DOTNET_NOLOGO: true
+
+jobs:
+  dotnet:
+    name: .NET (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os:
+          - ubuntu-latest
+          - windows-latest
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0
+
+      - name: Set up .NET
+        uses: actions/setup-dotnet@a98b56852c35b8e3190ac28c8c2271da59106c68 # v6.0.0
+        with:
+          dotnet-version: 10.0.x
+
+      - name: Restore
+        run: dotnet restore ACMP.slnx --locked-mode
+
+      - name: Build
+        run: dotnet build ACMP.slnx --configuration Release --no-restore
+
+      - name: Test
+        run: dotnet test ACMP.slnx --configuration Release --no-build
+
+      - name: Check vulnerable packages
+        run: dotnet list ACMP.slnx package --vulnerable --include-transitive
+
+      - name: Check deprecated packages
+        run: dotnet list ACMP.slnx package --deprecated --include-transitive
+
+  packages:
+    name: Package validation
+    runs-on: windows-latest
+    needs: dotnet
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0
+
+      - name: Set up .NET
+        uses: actions/setup-dotnet@a98b56852c35b8e3190ac28c8c2271da59106c68 # v6.0.0
+        with:
+          dotnet-version: 10.0.x
+
+      - name: Restore
+        run: dotnet restore ACMP.slnx --locked-mode
+
+      - name: Build
+        run: dotnet build ACMP.slnx --configuration Release --no-restore
+
+      - name: Pack NuGet package
+        shell: pwsh
+        run: |
+          dotnet pack .\src\ACMP\ACMP.csproj `
+            --configuration Release `
+            --no-build `
+            --output .\artifacts\nuget
+
+      - name: Test NuGet package
+        shell: pwsh
+        run: |
+          .\build\Test-NuGetPackage.ps1 `
+            -PackageDirectory .\artifacts\nuget
+
+      - name: Build PowerShell module
+        shell: pwsh
+        run: .\build\Build-PowerShellModule.ps1
+
+      - name: Validate module with PowerShell 7
+        shell: pwsh
+        run: .\build\Test-PowerShellModule.ps1
+
+      - name: Validate module with Windows PowerShell 5.1
+        shell: powershell
+        run: .\build\Test-PowerShellModule.ps1
+
+      - name: Upload package artifacts
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: acmp-packages
+          path: |
+            artifacts/nuget/*.nupkg
+            artifacts/nuget/*.snupkg
+            artifacts/powershell/ACMP
+
+  secret-scan:
+    name: Secret scan
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Check out complete history
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0
+
+      - name: Scan repository
+        uses: gitleaks/gitleaks-action@e0c47f4f8be36e29cdc102c57e68cb5cbf0e8d1e # v3.0.0
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GITLEAKS_LICENSE: ${{ secrets.GITLEAKS_LICENSE }}
+          GITLEAKS_VERSION: 8.30.1

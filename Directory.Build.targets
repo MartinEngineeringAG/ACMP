@@ -1,0 +1,8 @@
+<Project>
+  <Target Name="SetFullAssemblyVersion" AfterTargets="MinVer">
+    <PropertyGroup>
+      <AssemblyVersion>$(MinVerMajor).$(MinVerMinor).$(MinVerPatch).0</AssemblyVersion>
+      <FileVersion>$(MinVerMajor).$(MinVerMinor).$(MinVerPatch).0</FileVersion>
+    </PropertyGroup>
+  </Target>
+</Project>

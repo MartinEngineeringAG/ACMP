@@ -1,0 +1,5 @@
+<Solution>
+  <Project Path="src\ACMP\ACMP.csproj" />
+  <Project Path="src\ACMP.PowerShell\ACMP.PowerShell.csproj" />
+  <Project Path="tests\ACMP.Tests\ACMP.Tests.csproj" />
+</Solution>
