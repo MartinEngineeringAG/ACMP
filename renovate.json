@@ -1,6 +1,11 @@
 {
   "$schema": "https://docs.renovatebot.com/renovate-schema.json",
   "extends": [
-    "local>MartinEngineeringAG/renovate-config"
+    "config:best-practices",
+    "local>MartinEngineeringAG/renovate-config#v0.0.8",
+    "local>MartinEngineeringAG/renovate-config:monorepos#v0.0.8",
+    "local>MartinEngineeringAG/renovate-config//opinionated/schedules#v0.0.8",
+    "local>MartinEngineeringAG/renovate-config//opinionated/labels#v0.0.8",
+    "local>MartinEngineeringAG/renovate-config//opinionated/security#v0.0.8",
   ]
 }
