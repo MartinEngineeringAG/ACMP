@@ -161,6 +161,11 @@ It does not rebuild the packages. It:
 - pushes the prepared `.nupkg` to NuGet; and
 - extracts and publishes the prepared PowerShell module archive.
 
+If publication fails after the release has been published, fix the workflow on
+`main`, then run `Publish Release` manually with the existing primary release
+tag. The retry downloads and validates the published assets again, skips
+packages that already exist, and publishes any missing package.
+
 The `.nupkg`, `ACMP.dll`, and `ACMP.PowerShell.dll` published by this process
 are the files produced by the preparation build.
 
