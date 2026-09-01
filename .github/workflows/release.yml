@@ -4,6 +4,12 @@ on:
   release:
     types:
       - published
+  workflow_dispatch:
+    inputs:
+      release_tag:
+        description: Published release tag to retry
+        required: true
+        type: string
 
 permissions:
   contents: read
@@ -27,14 +33,29 @@ jobs:
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           fetch-depth: 0
-          ref: ${{ github.event.release.tag_name }}
+          ref: ${{ inputs.release_tag || github.event.release.tag_name }}
 
       - name: Download release assets
         shell: pwsh
         env:
           GH_TOKEN: ${{ github.token }}
-          RELEASE_TAG: ${{ github.event.release.tag_name }}
+          RELEASE_TAG: ${{ inputs.release_tag || github.event.release.tag_name }}
+          REPOSITORY: ${{ github.repository }}
         run: |
+          $release = gh release view $env:RELEASE_TAG `
+              --repo $env:REPOSITORY `
+              --json isDraft,isPrerelease,tagName |
+              ConvertFrom-Json
+          if ($LASTEXITCODE -ne 0) {
+              throw "Failed to resolve release '$env:RELEASE_TAG'."
+          }
+          if ($release.tagName -cne $env:RELEASE_TAG -or $release.isDraft) {
+              throw "Release '$env:RELEASE_TAG' must be published before its packages can be published."
+          }
+          if ($release.isPrerelease) {
+              throw 'GitHub prereleases cannot publish ACMP packages.'
+          }
+
           $null = New-Item `
               -ItemType Directory `
               -Path .\artifacts\release `
@@ -50,8 +71,8 @@ jobs:
         shell: pwsh
         env:
           EVENT_COMMIT: ${{ github.sha }}
-          IS_PRERELEASE: ${{ github.event.release.prerelease }}
-          RELEASE_TAG: ${{ github.event.release.tag_name }}
+          EVENT_NAME: ${{ github.event_name }}
+          RELEASE_TAG: ${{ inputs.release_tag || github.event.release.tag_name }}
           REPOSITORY: ${{ github.repository }}
         run: |
           $stableVersionPattern = '(?:0|[1-9]\d*)\.(?:0|[1-9]\d*)\.(?:0|[1-9]\d*)'
@@ -71,16 +92,13 @@ jobs:
           if ($manifest.primaryTag -cne $env:RELEASE_TAG) {
               throw "Release tag '$env:RELEASE_TAG' does not match manifest tag '$($manifest.primaryTag)'."
           }
-          if ($env:IS_PRERELEASE -eq 'true') {
-              throw 'GitHub prereleases cannot publish ACMP packages.'
-          }
-
           $headCommit = git rev-parse HEAD
           if ($LASTEXITCODE -ne 0) {
               throw 'Failed to resolve the checked-out release commit.'
           }
           if ($manifest.commit -cne $headCommit -or
-              $env:EVENT_COMMIT -cne $headCommit) {
+              ($env:EVENT_NAME -ceq 'release' -and
+                  $env:EVENT_COMMIT -cne $headCommit)) {
               throw "Release assets were prepared for '$($manifest.commit)', but the release points to '$headCommit'."
           }
 
@@ -275,6 +293,15 @@ jobs:
           PSGALLERY_API_KEY: ${{ secrets.PSGALLERY_API_KEY }}
           VERSION: ${{ needs.validate.outputs.powershell_version }}
         run: |
+          $gallery = Get-PSRepository `
+              -Name PSGallery `
+              -ErrorAction SilentlyContinue
+          if ($null -eq $gallery) {
+              Register-PSRepository `
+                  -Default `
+                  -ErrorAction Stop
+          }
+
           $existing = Find-Module `
               -Name ACMP `
               -RequiredVersion $env:VERSION `
