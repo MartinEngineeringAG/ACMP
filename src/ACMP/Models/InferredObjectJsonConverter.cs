@@ -26,7 +26,7 @@ namespace ACMP.Models
             JsonSerializer.Serialize(writer, value, value.GetType(), options);
         }
 
-        private static object? ConvertElement(JsonElement element)
+        internal static object? ConvertElement(JsonElement element)
         {
             switch (element.ValueKind)
             {

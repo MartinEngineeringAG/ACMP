@@ -4,6 +4,7 @@ using System.Text.Json.Serialization;
 
 namespace ACMP.Models
 {
+    [JsonConverter(typeof(ReportResultJsonConverter))]
     public class ReportResult
     {
         [JsonPropertyName("Rows")]
