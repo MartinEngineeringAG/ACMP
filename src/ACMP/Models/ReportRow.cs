@@ -1,10 +1,9 @@
-using System;
 using System.Collections.Generic;
-using System.Text.Json.Serialization;
 
 namespace ACMP.Models
 {
     public class ReportRow
     {
+        public List<ReportCell> Cells { get; set; } = new List<ReportCell>();
     }
 }

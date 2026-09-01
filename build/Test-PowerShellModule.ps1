@@ -206,6 +206,20 @@ try {
         -Name 'Imported cmdlets' `
         -Expected $declaredCmdlets `
         -Actual @($exportedCommands.Name)
+
+    $reportColumn = [ACMP.Models.ReportColumn]::new()
+    $reportColumn.CellIndex = 0
+    $reportColumn.Name = 'Quantity'
+    $reportColumn.Type = 'Decimal'
+    $reportCell = [ACMP.Models.ReportCell]::new()
+    $reportCell.Column = $reportColumn
+    $reportCell.Value = [decimal]11
+    $reportRow = [ACMP.Models.ReportRow]::new()
+    $reportRow.Cells.Add($reportCell)
+    if ($reportRow.Cells[0].Column.Name -cne 'Quantity' -or
+        $reportRow.Cells[0].Value -ne 11) {
+        throw 'Report rows must pair each value with its report column metadata.'
+    }
 }
 finally {
     Remove-Module -Name ACMP -Force -ErrorAction SilentlyContinue
